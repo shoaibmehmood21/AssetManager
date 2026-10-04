@@ -245,3 +245,8 @@ export async function setMeta(db: SQLiteDatabase, key: string, value: string | n
   if (value === null) await db.runAsync('DELETE FROM meta WHERE key = ?', key);
   else await db.runAsync('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', key, value);
 }
+
+export async function countAssets(db: SQLiteDatabase): Promise<number> {
+  const r = await db.getFirstAsync<{ n: number }>('SELECT COUNT(*) AS n FROM assets');
+  return r?.n ?? 0;
+}

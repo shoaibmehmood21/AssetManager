@@ -14,6 +14,7 @@ import {
   type ParseResult,
   parseSheetValues,
 } from '../lib/backup.ts';
+import { GOOGLE_IOS_CLIENT_ID, GOOGLE_WEB_CLIENT_ID, isGoogleConfigured } from '../config/google.ts';
 
 // drive.file only grants access to files this app created, which is all we
 // need: the app creates the backup spreadsheet and finds it again (on any
@@ -29,12 +30,11 @@ let configured = false;
 
 function configure() {
   if (configured) return;
-  const webClientId = process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID;
-  const iosClientId = process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID;
+  if (!isGoogleConfigured) throw new Error('Google backup is not set up in this version of the app.');
   GoogleSignin.configure({
     scopes: SCOPES,
-    ...(webClientId ? { webClientId } : {}),
-    ...(iosClientId ? { iosClientId } : {}),
+    ...(GOOGLE_WEB_CLIENT_ID ? { webClientId: GOOGLE_WEB_CLIENT_ID } : {}),
+    ...(GOOGLE_IOS_CLIENT_ID ? { iosClientId: GOOGLE_IOS_CLIENT_ID } : {}),
   });
   configured = true;
 }
@@ -52,6 +52,7 @@ export class SignInCancelledError extends Error {
 
 /** Returns the signed-in user without showing any UI, or null. */
 export async function getSignedInUser(): Promise<GoogleUser | null> {
+  if (!isGoogleConfigured) return null;
   configure();
   try {
     const res = await GoogleSignin.signInSilently();
@@ -80,13 +81,26 @@ export async function signIn(): Promise<GoogleUser> {
         throw new Error('Google Play Services is not available on this device.');
       }
       if (e.code === statusCodes.IN_PROGRESS) throw new Error('Sign-in is already in progress.');
+      // Android reports a package name / signing certificate mismatch as DEVELOPER_ERROR (code 10).
+      if (String(e.code) === '10' || /DEVELOPER_ERROR/i.test(e.message)) {
+        throw new Error(
+          'Google rejected this copy of the app (DEVELOPER_ERROR). The app’s package name and signing ' +
+            'certificate (SHA-1) must be registered as an Android OAuth client in Google Cloud.',
+        );
+      }
     }
     throw e;
   }
 }
 
+/** Disconnect: forget the account and revoke the app's access to it. */
 export async function signOut(): Promise<void> {
   configure();
+  try {
+    await GoogleSignin.revokeAccess();
+  } catch {
+    // Already revoked or offline — signing out locally is still enough.
+  }
   await GoogleSignin.signOut();
 }
 
@@ -134,6 +148,8 @@ async function googleFetch<T>(url: string, init: RequestInit = {}, retried = fal
 export interface SpreadsheetInfo {
   id: string;
   url: string;
+  /** ISO timestamp of the last change, when known. */
+  modifiedTime?: string;
 }
 
 type SpreadsheetMeta = {
@@ -168,10 +184,12 @@ export async function findBackupSpreadsheet(): Promise<SpreadsheetInfo | null> {
     spaces: 'drive',
     pageSize: '10',
   });
-  const res = await googleFetch<{ files: { id: string }[] }>(`${DRIVE_API}?${params.toString()}`);
+  const res = await googleFetch<{ files: { id: string; modifiedTime?: string }[] }>(
+    `${DRIVE_API}?${params.toString()}`,
+  );
   for (const f of res.files ?? []) {
     const meta = await getSpreadsheet(f.id);
-    if (meta) return { id: meta.spreadsheetId, url: meta.spreadsheetUrl };
+    if (meta) return { id: meta.spreadsheetId, url: meta.spreadsheetUrl, modifiedTime: f.modifiedTime };
   }
   return null;
 }
@@ -224,7 +242,7 @@ export async function backupToSheets(data: BackupData, knownId: string | null): 
     }),
   });
 
-  return { id: meta.spreadsheetId, url: meta.spreadsheetUrl };
+  return { id: meta.spreadsheetId, url: meta.spreadsheetUrl, modifiedTime: new Date().toISOString() };
 }
 
 /** Read and parse the backup spreadsheet. Does not touch the local database. */

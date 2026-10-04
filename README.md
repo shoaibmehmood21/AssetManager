@@ -13,7 +13,7 @@ An offline-first mobile app for Android and iPhone that tracks the value of your
 | --- | --- |
 | **Assets** | Every asset with its latest value and the total. Tap an asset to see its history, add an entry, edit or delete entries, or rename or delete the asset. |
 | **Report** | Pick a **From** and **To** date (or a quick range) and how the **date columns** are built: *Entry dates*, *Daily*, *Weekly*, *Monthly*, *Quarterly* or *Yearly*. The table shows one row per asset, one column per date, a **Change** column and a **Total** row. Scroll sideways to see more dates. *Share as CSV* exports the table. |
-| **Backup** | Sign in with Google, **Back up to Google Sheets**, **Restore from Google Sheets**, and open the backup spreadsheet. |
+| **Backup** | **Connect Google account**, then **Back up now** or **Restore from Google**. A new phone with no data offers to restore as soon as you connect. |
 
 ### How report columns work
 
@@ -48,19 +48,30 @@ Everything except Google backup works without any further setup.
 
 ## Google Sheets backup setup
 
-You need this once, so the app is allowed to create a spreadsheet in the user's Google Drive.
+**End users don't set anything up.** They open the **Backup** tab, tap **Connect Google account** and pick an account. If the phone has no data and a backup exists, for example on a new phone, the app offers to restore it right away.
 
-1. In the [Google Cloud Console](https://console.cloud.google.com/), create a project (or pick an existing one).
+Google requires every app that uses its APIs to be registered once by the app's owner. Do this one time. The IDs you get are not secrets: they go in `google.config.json` and ship inside every build.
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create a project.
 2. **APIs & Services → Library**: enable the **Google Sheets API** and the **Google Drive API**.
-3. **APIs & Services → OAuth consent screen**: configure it and add the scope `https://www.googleapis.com/auth/drive.file`. While the app is in *Testing* mode, add your Google account as a test user.
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID**. Create these clients:
-   - **Web application.** Its client ID is `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID`. Android needs it.
-   - **Android.** Package name `com.assetmanager.app` (or your `APP_BUNDLE_ID`), plus the SHA-1 of your signing key. For EAS builds, run `npx eas-cli@latest credentials` to see the SHA-1. Add one Android client for each signing key: debug, EAS and Play Store.
-   - **iOS.** Bundle ID `com.assetmanager.app` (or your `APP_BUNDLE_ID`). Its client ID is `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID`.
-5. Provide the IDs:
-   - For local builds, copy `.env.example` to `.env.local` and fill it in.
-   - For EAS cloud builds, `.env.local` is not uploaded. Add the same variables with `npx eas-cli@latest env:create` (or in the EAS dashboard) for each build environment.
-6. Rebuild the app. The iOS URL scheme is generated from the iOS client ID in `app.config.ts`.
+3. **APIs & Services → OAuth consent screen** (Google Auth Platform):
+   - Choose **External** and fill in the app name and support email.
+   - Under **Data access**, add the scope `https://www.googleapis.com/auth/drive.file`. It's a non-sensitive scope, so Google verification isn't needed.
+   - Under **Audience**, either add testers' Google accounts as test users, or click **Publish app** so any Google account can connect.
+4. **Clients → Create client**:
+   - **Web application** (name it anything). Copy its client ID into `webClientId` in `google.config.json`. Android needs this one.
+   - **Android**: package name `com.assetmanager.app`, plus the SHA-1 of every key that signs the app:
+     - The APK built by GitHub Actions and `npx expo run:android`: `5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25`
+     - EAS builds: run `npx eas-cli@latest credentials` to see the SHA-1.
+     - Google Play: copy the *App signing key* SHA-1 from Play Console → App integrity.
+   - **iOS**: bundle ID `com.assetmanager.app`. Copy its client ID into `iosClientId` in `google.config.json`.
+5. Commit `google.config.json` and rebuild the app.
+
+If **Connect Google account** shows *DEVELOPER_ERROR*, the APK's signing SHA-1 or package name doesn't match an Android client from step 4.
+
+Until `google.config.json` is filled in, the Backup tab says Google backup isn't available, and the rest of the app works normally.
+
+To get a test APK, push to the repository: the **Build Android APK** GitHub Action builds one and attaches it to the run as `asset-manager-apk`.
 
 ### What the backup contains
 
@@ -78,6 +89,7 @@ The app only requests the `drive.file` scope, so it can see only the files it cr
 
 ```
 app.config.ts             Expo config (bundle ID, plugins, Google URL scheme)
+google.config.json        Google OAuth client IDs (public, shipped in the app)
 src/app/                  Screens (Expo Router)
   (tabs)/index.tsx        Assets list
   (tabs)/report.tsx       Report table

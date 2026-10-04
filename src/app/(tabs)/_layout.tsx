@@ -7,7 +7,10 @@ import { colors } from '../../components/ui.tsx';
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
 function icon(name: IconName) {
-  return ({ color, size }: { color: ColorValue; size: number }) => <Ionicons name={name} color={color} size={size} />;
+  function TabIcon({ color, size }: { color: ColorValue; size: number }) {
+    return <Ionicons name={name} color={color} size={size} />;
+  }
+  return TabIcon;
 }
 
 export default function TabsLayout() {

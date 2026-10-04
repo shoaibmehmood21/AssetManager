@@ -1,10 +1,12 @@
+import Ionicons from '@expo/vector-icons/Ionicons';
 import { useFocusEffect } from 'expo-router';
 import { useSQLiteContext } from 'expo-sqlite';
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, Linking, ScrollView, Text } from 'react-native';
+import { ActivityIndicator, Alert, Linking, ScrollView, Text, View } from 'react-native';
 
-import { Button, Card, styles } from '../../components/ui.tsx';
-import { exportAll, getMeta, replaceAll, setMeta } from '../../db/database.ts';
+import { Button, Card, colors, styles } from '../../components/ui.tsx';
+import { isGoogleConfigured } from '../../config/google.ts';
+import { countAssets, exportAll, getMeta, replaceAll, setMeta } from '../../db/database.ts';
 import {
   BACKUP_SPREADSHEET_TITLE,
   SignInCancelledError,
@@ -15,35 +17,69 @@ import {
   signIn,
   signOut,
   type GoogleUser,
+  type SpreadsheetInfo,
 } from '../../google/googleSheets.ts';
 
 const META_SPREADSHEET_ID = 'backup.spreadsheetId';
-const META_SPREADSHEET_URL = 'backup.spreadsheetUrl';
 const META_LAST_BACKUP = 'backup.lastBackupAt';
+
+type Busy = 'checking' | 'connect' | 'backup' | 'restore' | null;
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+function formatTime(iso: string | undefined | null): string {
+  return iso ? new Date(iso).toLocaleString() : 'unknown';
+}
+
 export default function BackupScreen() {
   const db = useSQLiteContext();
   const [user, setUser] = useState<GoogleUser | null>(null);
-  const [busy, setBusy] = useState<'signin' | 'backup' | 'restore' | null>(null);
+  const [busy, setBusy] = useState<Busy>(isGoogleConfigured ? 'checking' : null);
   const [lastBackup, setLastBackup] = useState<string | null>(null);
-  const [sheetUrl, setSheetUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    getSignedInUser().then(setUser);
-  }, []);
+  // undefined = not looked up yet, null = looked up and none exists
+  const [remote, setRemote] = useState<SpreadsheetInfo | null | undefined>(undefined);
 
   useFocusEffect(
     useCallback(() => {
       getMeta(db, META_LAST_BACKUP).then(setLastBackup);
-      getMeta(db, META_SPREADSHEET_URL).then(setSheetUrl);
     }, [db]),
   );
 
-  const run = async (kind: 'signin' | 'backup' | 'restore', task: () => Promise<void>) => {
+  const lookUpBackup = useCallback(async () => {
+    const found = await findBackupSpreadsheet();
+    setRemote(found);
+    return found;
+  }, []);
+
+  const restoreFrom = useCallback(
+    async (sheet: SpreadsheetInfo, askFirst: boolean) => {
+      const { data, skippedRows } = await readBackup(sheet.id);
+      const localCount = await countAssets(db);
+      const confirmed = await new Promise<boolean>((resolve) =>
+        Alert.alert(
+          askFirst ? 'Backup found' : 'Restore backup?',
+          `Your Google backup from ${formatTime(sheet.modifiedTime)} has ${data.assets.length} assets and ` +
+            `${data.entries.length} entries.` +
+            (skippedRows ? ` ${skippedRows} invalid row(s) will be skipped.` : '') +
+            (localCount > 0 ? '\n\nThe data currently on this phone will be replaced.' : '\n\nRestore it to this phone?'),
+          [
+            { text: askFirst ? 'Not now' : 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+            { text: 'Restore', style: localCount > 0 ? 'destructive' : 'default', onPress: () => resolve(true) },
+          ],
+          { cancelable: true, onDismiss: () => resolve(false) },
+        ),
+      );
+      if (!confirmed) return;
+      await replaceAll(db, data);
+      await setMeta(db, META_SPREADSHEET_ID, sheet.id);
+      Alert.alert('Restore complete', `Imported ${data.assets.length} assets and ${data.entries.length} entries.`);
+    },
+    [db],
+  );
+
+  const run = useCallback(async (kind: Exclude<Busy, null>, task: () => Promise<void>) => {
     setBusy(kind);
     try {
       await task();
@@ -52,125 +88,148 @@ export default function BackupScreen() {
     } finally {
       setBusy(null);
     }
-  };
+  }, []);
 
-  const handleSignIn = () => run('signin', async () => setUser(await signIn()));
+  // Reconnect silently if the user connected before. `busy` starts as 'checking'.
+  useEffect(() => {
+    if (!isGoogleConfigured) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const u = await getSignedInUser();
+        if (cancelled) return;
+        setUser(u);
+        if (u) await lookUpBackup();
+      } catch {
+        // Offline or Google unreachable — the user can still connect manually.
+      } finally {
+        if (!cancelled) setBusy(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [lookUpBackup]);
 
-  const handleSignOut = async () => {
-    await signOut();
-    setUser(null);
-  };
+  const connect = () =>
+    run('connect', async () => {
+      const u = await signIn();
+      setUser(u);
+      const found = await lookUpBackup();
+      // New phone or fresh install: offer to bring the data back right away.
+      if (found && (await countAssets(db)) === 0) await restoreFrom(found, true);
+    });
 
-  const handleBackup = () =>
+  const disconnect = () =>
+    Alert.alert('Disconnect Google account?', 'Your backup stays in Google Drive. You can reconnect any time.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Disconnect',
+        style: 'destructive',
+        onPress: async () => {
+          await signOut();
+          setUser(null);
+          setRemote(undefined);
+        },
+      },
+    ]);
+
+  const backup = () =>
     run('backup', async () => {
-      if (!user) setUser(await signIn());
       const data = await exportAll(db);
-      const sheet = await backupToSheets(data, await getMeta(db, META_SPREADSHEET_ID));
+      const sheet = await backupToSheets(data, remote?.id ?? (await getMeta(db, META_SPREADSHEET_ID)));
       const now = new Date().toISOString();
       await setMeta(db, META_SPREADSHEET_ID, sheet.id);
-      await setMeta(db, META_SPREADSHEET_URL, sheet.url);
       await setMeta(db, META_LAST_BACKUP, now);
-      setSheetUrl(sheet.url);
+      setRemote(sheet);
       setLastBackup(now);
-      Alert.alert(
-        'Backup complete',
-        `Saved ${data.assets.length} assets and ${data.entries.length} entries to “${BACKUP_SPREADSHEET_TITLE}” in your Google Drive.`,
-      );
+      Alert.alert('Backup complete', `Saved ${data.assets.length} assets and ${data.entries.length} entries to Google Sheets.`);
     });
 
-  const handleRestore = () =>
+  const restore = () =>
     run('restore', async () => {
-      if (!user) setUser(await signIn());
-      const knownId = await getMeta(db, META_SPREADSHEET_ID);
-      const sheet = knownId ? { id: knownId, url: sheetUrl ?? '' } : await findBackupSpreadsheet();
-      if (!sheet) {
-        Alert.alert('No backup found', `There is no “${BACKUP_SPREADSHEET_TITLE}” spreadsheet in this Google account.`);
+      const found = await lookUpBackup();
+      if (!found) {
+        Alert.alert('No backup found', `There is no “${BACKUP_SPREADSHEET_TITLE}” in ${user?.email ?? 'this account'}.`);
         return;
       }
-      let result;
-      try {
-        result = await readBackup(sheet.id);
-      } catch (e) {
-        // The remembered sheet may have been deleted — fall back to searching Drive.
-        if (!knownId) throw e;
-        const found = await findBackupSpreadsheet();
-        if (!found) throw e;
-        Object.assign(sheet, found);
-        result = await readBackup(found.id);
-      }
-      const { data, skippedRows } = result;
-      const confirmed = await new Promise<boolean>((resolve) =>
-        Alert.alert(
-          'Replace data on this device?',
-          `The backup has ${data.assets.length} assets and ${data.entries.length} entries.` +
-            (skippedRows ? ` ${skippedRows} invalid row(s) will be skipped.` : '') +
-            '\n\nAll assets and entries currently on this device will be replaced.',
-          [
-            { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
-            { text: 'Replace', style: 'destructive', onPress: () => resolve(true) },
-          ],
-          { cancelable: true, onDismiss: () => resolve(false) },
-        ),
-      );
-      if (!confirmed) return;
-      await replaceAll(db, data);
-      await setMeta(db, META_SPREADSHEET_ID, sheet.id);
-      if (sheet.url) {
-        await setMeta(db, META_SPREADSHEET_URL, sheet.url);
-        setSheetUrl(sheet.url);
-      }
-      Alert.alert('Restore complete', `Imported ${data.assets.length} assets and ${data.entries.length} entries.`);
+      await restoreFrom(found, false);
     });
+
+  const connected = user !== null;
+  const working = busy !== null;
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Card>
-        <Text style={styles.title}>Works offline</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <Ionicons name="phone-portrait-outline" size={22} color={colors.primary} />
+          <Text style={styles.title}>Your data stays on this phone</Text>
+        </View>
         <Text style={styles.muted}>
-          Your assets are stored only on this device. Back up to Google Sheets whenever you like, and restore from it
-          on a new phone by signing in with the same Google account.
+          The app works fully offline. Connect a Google account only if you want a backup in Google Sheets — for
+          example to move your data to a new phone.
         </Text>
       </Card>
 
       <Card>
-        <Text style={styles.title}>Google account</Text>
-        {user ? (
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <Ionicons name="logo-google" size={20} color={connected ? colors.positive : colors.muted} />
+          <Text style={styles.title}>Google account</Text>
+        </View>
+        {!isGoogleConfigured ? (
+          <Text style={styles.muted}>Google backup is not available in this version of the app.</Text>
+        ) : busy === 'checking' ? (
+          <ActivityIndicator style={{ alignSelf: 'flex-start' }} />
+        ) : connected ? (
           <>
-            <Text style={styles.text}>{user.name ? `${user.name} (${user.email})` : user.email}</Text>
-            <Button title="Sign out" variant="secondary" onPress={handleSignOut} disabled={busy !== null} />
+            <Text style={styles.text}>Connected as {user.email}</Text>
+            <Button title="Disconnect" variant="secondary" onPress={disconnect} disabled={working} />
           </>
         ) : (
           <>
-            <Text style={styles.muted}>Not signed in.</Text>
-            <Button title="Sign in with Google" onPress={handleSignIn} loading={busy === 'signin'} disabled={busy !== null} />
+            <Text style={styles.muted}>
+              Connect to back up and restore. The app can only see the backup spreadsheet it creates — not the rest of
+              your Google Drive.
+            </Text>
+            <Button title="Connect Google account" onPress={connect} loading={busy === 'connect'} disabled={working} />
           </>
         )}
       </Card>
 
-      <Card>
-        <Text style={styles.title}>Backup</Text>
-        <Text style={styles.muted}>
-          {lastBackup ? `Last backup: ${new Date(lastBackup).toLocaleString()}` : 'No backup made from this device yet.'}
-        </Text>
-        <Button title="Back up to Google Sheets" onPress={handleBackup} loading={busy === 'backup'} disabled={busy !== null} />
-        {sheetUrl && (
-          <Button title="Open backup spreadsheet" variant="secondary" onPress={() => Linking.openURL(sheetUrl)} />
-        )}
-      </Card>
+      {connected && (
+        <>
+          <Card>
+            <Text style={styles.title}>Backup</Text>
+            <Text style={styles.muted}>
+              {remote === undefined
+                ? 'Looking for an existing backup…'
+                : remote
+                  ? `Backup in Google Drive, last updated ${formatTime(remote.modifiedTime)}.`
+                  : 'No backup in this Google account yet.'}
+              {lastBackup ? `\nLast backup from this phone: ${formatTime(lastBackup)}.` : ''}
+            </Text>
+            <Button title="Back up now" onPress={backup} loading={busy === 'backup'} disabled={working} />
+            {remote && (
+              <Button title="Open backup in Google Sheets" variant="secondary" onPress={() => Linking.openURL(remote.url)} />
+            )}
+          </Card>
 
-      <Card>
-        <Text style={styles.title}>Restore</Text>
-        <Text style={styles.muted}>
-          Import assets and entries from your “{BACKUP_SPREADSHEET_TITLE}” spreadsheet. Use this after switching devices.
-        </Text>
-        <Button
-          title="Restore from Google Sheets"
-          variant="secondary"
-          onPress={handleRestore}
-          loading={busy === 'restore'}
-          disabled={busy !== null}
-        />
-      </Card>
+          <Card>
+            <Text style={styles.title}>Restore</Text>
+            <Text style={styles.muted}>
+              Replace the data on this phone with your Google backup. Use this after switching phones.
+            </Text>
+            <Button
+              title="Restore from Google"
+              variant="secondary"
+              onPress={restore}
+              loading={busy === 'restore'}
+              disabled={working || remote === null}
+            />
+          </Card>
+        </>
+      )}
     </ScrollView>
   );
 }

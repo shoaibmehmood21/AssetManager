@@ -1,8 +1,10 @@
 import type { ExpoConfig } from 'expo/config';
 
-// Google OAuth client IDs are read from environment variables so they never
-// have to be committed. See README.md → "Google Sheets backup setup".
-const iosClientId = process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID ?? '';
+import googleConfig from './google.config.json';
+
+// Google OAuth client IDs live in google.config.json (an environment variable
+// overrides it). See README.md → "Google Sheets backup setup".
+const iosClientId = process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID || googleConfig.iosClientId;
 
 // The iOS URL scheme is the iOS client ID reversed, e.g.
 // 1234-abc.apps.googleusercontent.com → com.googleusercontent.apps.1234-abc
